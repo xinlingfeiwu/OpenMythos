@@ -694,7 +694,8 @@ class LTIInjection(nn.Module):
         # Compute in log space to avoid 0 * inf = NaN when log_dt → -∞, log_A → +∞.
         # dt * A_c = -exp(log_dt) * exp(log_A) = -exp(log_dt + log_A)
         # Clamp keeps the product finite in float32 for any gradient step size.
-        return torch.exp(-torch.exp((self.log_dt + self.log_A).clamp(-20, 20)))
+        A = torch.exp(-torch.exp((self.log_dt + self.log_A).clamp(-20, 20)))
+        return A.clamp(max=1.0 - torch.finfo(A.dtype).eps)
 
     def forward(
         self, h: torch.Tensor, e: torch.Tensor, transformer_out: torch.Tensor
@@ -859,6 +860,12 @@ class RecurrentBlock(nn.Module):
             # later decode steps find populated keys at every cache_key.
             if halted.all() and kv_cache is None:
                 break
+
+        # If the loop budget expires before ACT reaches the threshold, assign
+        # the remaining probability mass to the final hidden state so the
+        # weighted sum remains properly normalized.
+        remaining = (1.0 - cumulative_p).clamp(min=0) * (~halted).float()
+        h_out = h_out + remaining.unsqueeze(-1) * h
 
         return h_out
 

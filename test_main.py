@@ -261,7 +261,7 @@ class TestGQAttention:
         self.cfg = gqa_cfg()
         self.freqs = precompute_rope_freqs(
             self.cfg.dim // self.cfg.n_heads, self.cfg.max_seq_len
-        )
+        )[:T]
         self.attn = GQAttention(self.cfg)
 
     def test_output_shape(self):
@@ -297,7 +297,7 @@ class TestMLAttention:
         self.cfg = mla_cfg()
         self.freqs = precompute_rope_freqs(
             self.cfg.qk_rope_head_dim, self.cfg.max_seq_len
-        )
+        )[:T]
         self.attn = MLAttention(self.cfg)
 
     def test_output_shape(self):
@@ -430,21 +430,21 @@ class TestTransformerBlock:
     def test_gqa_output_shape(self):
         cfg = gqa_cfg()
         block = TransformerBlock(cfg, use_moe=False)
-        freqs = precompute_rope_freqs(cfg.dim // cfg.n_heads, cfg.max_seq_len)
+        freqs = precompute_rope_freqs(cfg.dim // cfg.n_heads, cfg.max_seq_len)[:T]
         x = torch.randn(B, T, cfg.dim)
         assert block(x, freqs).shape == (B, T, cfg.dim)
 
     def test_mla_output_shape(self):
         cfg = mla_cfg()
         block = TransformerBlock(cfg, use_moe=False)
-        freqs = precompute_rope_freqs(cfg.qk_rope_head_dim, cfg.max_seq_len)
+        freqs = precompute_rope_freqs(cfg.qk_rope_head_dim, cfg.max_seq_len)[:T]
         x = torch.randn(B, T, cfg.dim)
         assert block(x, freqs).shape == (B, T, cfg.dim)
 
     def test_moe_block_output_shape(self):
         cfg = gqa_cfg()
         block = TransformerBlock(cfg, use_moe=True)
-        freqs = precompute_rope_freqs(cfg.dim // cfg.n_heads, cfg.max_seq_len)
+        freqs = precompute_rope_freqs(cfg.dim // cfg.n_heads, cfg.max_seq_len)[:T]
         x = torch.randn(B, T, cfg.dim)
         assert block(x, freqs).shape == (B, T, cfg.dim)
 
@@ -521,7 +521,7 @@ class TestRecurrentBlock:
         self.block = RecurrentBlock(self.cfg)
         self.freqs = precompute_rope_freqs(
             self.cfg.dim // self.cfg.n_heads, self.cfg.max_seq_len
-        )
+        )[:T]
 
     def test_output_shape(self):
         h = torch.randn(B, T, self.cfg.dim)
@@ -541,6 +541,30 @@ class TestRecurrentBlock:
         e = torch.randn(B, T, self.cfg.dim)
         out = self.block(h, e, self.freqs, n_loops=1)
         assert out.shape == (B, T, self.cfg.dim)
+
+    def test_assigns_remainder_when_tokens_never_halt(self):
+        class ZeroAct(torch.nn.Module):
+            def forward(self, h):
+                return torch.zeros(h.shape[:2], device=h.device, dtype=h.dtype)
+
+        self.block.act = ZeroAct()
+        h = torch.randn(B, T, self.cfg.dim)
+        e = torch.randn(B, T, self.cfg.dim)
+
+        h_loop = loop_index_embedding(h, 0, self.block.loop_dim)
+        combined = self.block.norm(h_loop + e)
+        trans_out = self.block.block(
+            combined,
+            self.freqs,
+            None,
+            None,
+            cache_key="recurrent_loop_0",
+        )
+        trans_out = trans_out + self.block.lora(trans_out, 0)
+        expected = self.block.injection(h, e, trans_out)
+
+        out = self.block(h, e, self.freqs, n_loops=1)
+        assert torch.allclose(out, expected, atol=1e-5)
 
 
 # ---------------------------------------------------------------------------
@@ -601,7 +625,7 @@ class TestOpenMythosGQA:
 # ---------------------------------------------------------------------------
 
 
-class TestOpenMythosMLА:
+class TestOpenMythosMLA:
     def setup_method(self):
         self.cfg = mla_cfg()
         self.model = OpenMythos(self.cfg)

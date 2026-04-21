@@ -10,12 +10,14 @@ Multi-GPU:
 """
 
 import os
+import json
 import math
 import time
+import logging
+from dataclasses import asdict, is_dataclass
 import torch
 import torch.nn as nn
 import torch.distributed as dist
-from loguru import logger
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
     ShardingStrategy,
@@ -33,6 +35,28 @@ from open_mythos import OpenMythos
 from open_mythos.main import TransformerBlock, RecurrentBlock
 from open_mythos.variants import mythos_3b
 from open_mythos.tokenizer import MythosTokenizer
+
+try:
+    from loguru import logger
+except ImportError:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+    class _FallbackLogger:
+        def __init__(self):
+            self._logger = logging.getLogger("open_mythos.training")
+
+        def info(self, message):
+            self._logger.info(message)
+
+        def warning(self, message):
+            self._logger.warning(message)
+
+        def success(self, message):
+            self._logger.info(message)
+
+    logger = _FallbackLogger()
+
+DEFAULT_FINEWEB_DATASET_REVISION = "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9"
 
 
 # ---------------------------------------------------------------------------
@@ -56,7 +80,15 @@ class FineWebEduDataset(IterableDataset):
     cost of a true resumable loader.
     """
 
-    def __init__(self, encoding, seq_len: int, subset: str, rank: int, world_size: int):
+    def __init__(
+        self,
+        encoding,
+        seq_len: int,
+        subset: str,
+        rank: int,
+        world_size: int,
+        revision: str,
+    ):
         """
         Args:
             encoding   -- tokenizer exposing `.encode(str) -> list[int]`
@@ -70,6 +102,7 @@ class FineWebEduDataset(IterableDataset):
         self.subset = subset
         self.rank = rank
         self.world_size = world_size
+        self.revision = revision
 
     def __iter__(self):
         """
@@ -93,6 +126,7 @@ class FineWebEduDataset(IterableDataset):
             "HuggingFaceFW/fineweb-edu",
             name=self.subset,
             split="train",
+            revision=self.revision,
             streaming=True,
         ).shard(num_shards=total_shards, index=shard_index)
 
@@ -235,21 +269,35 @@ def save_checkpoint(
     os.makedirs(ckpt_dir, exist_ok=True)
     final_path = os.path.join(ckpt_dir, f"step_{step:07d}.pt")
     tmp_path = final_path + ".tmp"
+    metadata_path = final_path + ".json"
+    metadata_tmp_path = metadata_path + ".tmp"
     torch.save(
         {
             "step": step,
             "model": model_state,
             "optimizer": optim_state,
-            "cfg": cfg,
             "vocab_size": vocab_size,
         },
         tmp_path,
     )
     os.replace(tmp_path, final_path)
+    metadata = {
+        "format_version": 2,
+        "step": step,
+        "vocab_size": vocab_size,
+        "cfg": asdict(cfg) if is_dataclass(cfg) else None,
+    }
+    with open(metadata_tmp_path, "w", encoding="utf-8") as fh:
+        json.dump(metadata, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(metadata_tmp_path, metadata_path)
 
     for old in _list_ckpts(ckpt_dir)[:-keep_last]:
         try:
             os.remove(old)
+            metadata_file = old + ".json"
+            if os.path.exists(metadata_file):
+                os.remove(metadata_file)
         except OSError as exc:
             logger.warning(f"Failed to prune old checkpoint {old}: {exc}")
 
@@ -266,9 +314,9 @@ def load_checkpoint(model, optimizer, path: str, ddp: bool) -> int:
     and optimizer loads across two `state_dict_type` blocks has historically
     produced optimizer state bound to the wrong shard shapes.
 
-    `weights_only=False` is required because the checkpoint contains the
-    pickled `cfg` dataclass — flip to `weights_only=True` only if you
-    separate config out.
+    Checkpoints now store only tensors and primitive metadata in the `.pt`
+    payload so the restore path can use `weights_only=True`. Human-readable
+    config metadata is written alongside each checkpoint as `*.pt.json`.
 
     Args:
         model     -- same FSDP-wrapped or raw model used during save
@@ -281,7 +329,13 @@ def load_checkpoint(model, optimizer, path: str, ddp: bool) -> int:
         The step number the checkpoint was taken at; the caller advances the
         training loop from this value.
     """
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    try:
+        ckpt = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception as exc:
+        raise RuntimeError(
+            "Refusing to load an unsafe or legacy checkpoint payload. "
+            "Only v2 checkpoints written without pickled config metadata are supported."
+        ) from exc
 
     if ddp:
         with FSDP.state_dict_type(
@@ -362,11 +416,19 @@ def main():
     # ------------------------------------------------------------------
     # Tokenizer
     # ------------------------------------------------------------------
-    encoding = MythosTokenizer()
+    tokenizer_revision = os.environ.get(
+        "OPENMYTHOS_TOKENIZER_REVISION", "6cee5e81ee83917806bbde320786a8fb61efebee"
+    )
+    dataset_revision = os.environ.get(
+        "OPENMYTHOS_FINEWEB_EDU_REVISION", DEFAULT_FINEWEB_DATASET_REVISION
+    )
+    encoding = MythosTokenizer(revision=tokenizer_revision)
     vocab_size = encoding.vocab_size
 
     if master:
-        logger.info(f"Tokenizer: gpt-oss-20b  |  Vocab size: {vocab_size:,}")
+        logger.info(
+            f"Tokenizer: gpt-oss-20b@{tokenizer_revision[:12]}  |  Vocab size: {vocab_size:,}"
+        )
 
     # ------------------------------------------------------------------
     # Hyperparameters
@@ -389,6 +451,9 @@ def main():
         logger.info(
             f"seq_len={seq_len} | micro_batch={micro_batch} | grad_accum={grad_accum} | "
             f"global_batch_tokens={global_batch_tok:,} | total_steps={total_steps:,}"
+        )
+        logger.info(
+            f"Dataset: HuggingFaceFW/fineweb-edu@{dataset_revision[:12]}  |  subset={dataset_subset}"
         )
 
     # ------------------------------------------------------------------
@@ -458,7 +523,14 @@ def main():
     # ------------------------------------------------------------------
     # Dataset + DataLoader
     # ------------------------------------------------------------------
-    dataset = FineWebEduDataset(encoding, seq_len, dataset_subset, rank, world_size)
+    dataset = FineWebEduDataset(
+        encoding,
+        seq_len,
+        dataset_subset,
+        rank,
+        world_size,
+        dataset_revision,
+    )
     loader = DataLoader(dataset, batch_size=micro_batch, num_workers=4, pin_memory=True)
 
     # ------------------------------------------------------------------

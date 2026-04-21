@@ -1,6 +1,9 @@
+from typing import Optional
+
 from transformers import AutoTokenizer
 
 DEFAULT_MODEL_ID = "openai/gpt-oss-20b"
+DEFAULT_MODEL_REVISION = "6cee5e81ee83917806bbde320786a8fb61efebee"
 
 
 class MythosTokenizer:
@@ -20,14 +23,33 @@ class MythosTokenizer:
         >>> s = tok.decode(ids)
     """
 
-    def __init__(self, model_id: str = DEFAULT_MODEL_ID):
+    def __init__(
+        self,
+        model_id: str = DEFAULT_MODEL_ID,
+        revision: str = DEFAULT_MODEL_REVISION,
+        local_files_only: bool = False,
+        cache_dir: Optional[str] = None,
+    ):
         """
         Initialize the MythosTokenizer.
 
         Args:
             model_id (str): HuggingFace model identifier or path to tokenizer files.
+            revision (str): Pinned model revision or commit hash to load.
+            local_files_only (bool): If True, do not hit the network.
+            cache_dir (str | None): Optional Hugging Face cache directory override.
         """
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+        self.model_id = model_id
+        self.revision = revision
+        self.local_files_only = local_files_only
+        self.cache_dir = cache_dir
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_id,
+            revision=revision,
+            local_files_only=local_files_only,
+            cache_dir=cache_dir,
+            trust_remote_code=False,
+        )
 
     @property
     def vocab_size(self) -> int:
@@ -62,3 +84,33 @@ class MythosTokenizer:
             str: Decoded string representation of the token IDs.
         """
         return self.tokenizer.decode(token_ids, skip_special_tokens=True)
+
+
+def load_tokenizer(
+    model_id: str = DEFAULT_MODEL_ID,
+    revision: str = DEFAULT_MODEL_REVISION,
+    local_files_only: bool = False,
+    cache_dir: Optional[str] = None,
+) -> MythosTokenizer:
+    """Construct and return a pinned MythosTokenizer instance."""
+    return MythosTokenizer(
+        model_id=model_id,
+        revision=revision,
+        local_files_only=local_files_only,
+        cache_dir=cache_dir,
+    )
+
+
+def get_vocab_size(
+    model_id: str = DEFAULT_MODEL_ID,
+    revision: str = DEFAULT_MODEL_REVISION,
+    local_files_only: bool = False,
+    cache_dir: Optional[str] = None,
+) -> int:
+    """Return the tokenizer vocabulary size for the configured pinned revision."""
+    return load_tokenizer(
+        model_id=model_id,
+        revision=revision,
+        local_files_only=local_files_only,
+        cache_dir=cache_dir,
+    ).vocab_size

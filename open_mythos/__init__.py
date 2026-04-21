@@ -15,7 +15,7 @@ from open_mythos.main import (
     loop_index_embedding,
     precompute_rope_freqs,
 )
-from open_mythos.tokenizer import MythosTokenizer
+from open_mythos.tokenizer import MythosTokenizer, get_vocab_size, load_tokenizer
 from open_mythos.variants import (
     mythos_1b,
     mythos_1t,
