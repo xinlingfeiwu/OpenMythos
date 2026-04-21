@@ -147,14 +147,19 @@ def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 
     Args:
         x         -- tensor of shape (B, T, H, head_dim); head_dim must be even
-        freqs_cis -- precomputed complex frequencies of shape (max_len, head_dim//2)
+        freqs_cis -- precomputed complex frequencies of shape (T, head_dim//2),
+                     already sliced to exactly the positions being processed
+                     (caller is responsible for correct start_pos offset)
 
     Returns:
         Rotated tensor of the same shape and dtype as x
     """
     xc = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-    freqs_cis = freqs_cis[: x.shape[1]].unsqueeze(0).unsqueeze(2)
-    return torch.view_as_real(xc * freqs_cis).flatten(-2).to(x.dtype)
+    return (
+        torch.view_as_real(xc * freqs_cis.unsqueeze(0).unsqueeze(2))
+        .flatten(-2)
+        .to(x.dtype)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -472,10 +477,14 @@ class MoEFFN(nn.Module):
         B, T, D = x.shape
         flat = x.view(B * T, D)
 
-        # router — bias shifts logits for load balancing without touching loss
-        logits = self.router(flat) + self.router_bias  # (B*T, n_experts)
+        # Aux-loss-free load balancing (DeepSeek-V3): the bias shifts only the
+        # selection of which experts fire so underused experts are picked more,
+        # but the gating weights come from unbiased softmax scores so the bias
+        # never shows up in the gradient.
+        logits = self.router(flat)  # (B*T, n_experts), unbiased
         scores = F.softmax(logits, dim=-1)
-        topk_scores, topk_idx = scores.topk(self.topk, dim=-1)
+        _, topk_idx = (logits + self.router_bias).topk(self.topk, dim=-1)
+        topk_scores = scores.gather(-1, topk_idx)
         topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True)  # renorm
 
         # routed expert dispatch (token-level scatter)
@@ -572,7 +581,12 @@ class LoRAAdapter(nn.Module):
         Returns:
             Delta tensor of shape (B, T, dim) to be added to the block output
         """
-        s = self.scale(torch.tensor(loop_t, device=x.device))  # (rank,)
+        # Clamp for depth extrapolation: at inference n_loops can exceed the
+        # training max_loop_iters. Iterations beyond the trained range reuse
+        # the last learned per-loop scale rather than indexing out of range.
+        max_t = self.scale.num_embeddings - 1
+        t_idx = loop_t if loop_t <= max_t else max_t
+        s = self.scale(torch.tensor(t_idx, device=x.device))  # (rank,)
         down = self.down(x) * s  # (B, T, rank)
         return down @ self.B  # (B, T, dim)
 
@@ -824,19 +838,26 @@ class RecurrentBlock(nn.Module):
             still_running = ~halted
 
             # ACT remainder trick: once cumulative_p + p crosses threshold,
-            # assign the remaining probability mass as the final weight
+            # assign the remaining probability mass as the final weight.
+            # Gate by still_running so halted positions contribute exactly
+            # once (on the halting step) and zero thereafter — otherwise
+            # threshold<1 leaves a non-zero remainder that leaks every step.
             remainder = (1.0 - cumulative_p).clamp(min=0)
             weight = torch.where(
                 cumulative_p + p >= self.cfg.act_threshold,
                 remainder,
                 p,
             )
+            weight = weight * still_running.float()
             h_out = h_out + weight.unsqueeze(-1) * h
 
             cumulative_p = cumulative_p + p * still_running.float()
             halted = halted | (cumulative_p >= self.cfg.act_threshold)
 
-            if halted.all():
+            # Only short-circuit when there is no KV cache to keep consistent.
+            # With a cache, every loop depth must run on every forward pass so
+            # later decode steps find populated keys at every cache_key.
+            if halted.all() and kv_cache is None:
                 break
 
         return h_out
@@ -936,6 +957,7 @@ class OpenMythos(nn.Module):
         input_ids: torch.Tensor,
         n_loops: Optional[int] = None,
         kv_cache: Optional[dict] = None,
+        start_pos: int = 0,
     ) -> torch.Tensor:
         """
         Forward pass through Prelude → Recurrent Block → Coda.
@@ -946,17 +968,21 @@ class OpenMythos(nn.Module):
                          Increase at inference to extrapolate to harder problems.
             kv_cache  -- dict mutated in-place for autoregressive KV caching;
                          pass an empty dict {} and reuse across decode steps
+            start_pos -- index of the first token in input_ids within the full
+                         sequence; used to select the correct RoPE frequencies
+                         during incremental decoding (0 for prefill, prompt_len
+                         for each subsequent decode step)
 
         Returns:
             Logits of shape (B, T, vocab_size)
         """
-        B, T = input_ids.shape
+        T = input_ids.shape[1]
         device = input_ids.device
 
         x = self.embed(input_ids)
         freqs_cis = (
             self.freqs_cis_mla if self.cfg.attn_type == "mla" else self.freqs_cis
-        )[:T]
+        )[start_pos : start_pos + T]
         mask = self._causal_mask(T, device) if T > 1 else None
 
         for i, layer in enumerate(self.prelude):
@@ -1001,9 +1027,17 @@ class OpenMythos(nn.Module):
             Token indices of shape (B, T + max_new_tokens)
         """
         kv_cache: dict = {}
+        prompt_len = input_ids.shape[1]
         for step in range(max_new_tokens):
-            cur_ids = input_ids if step == 0 else input_ids[:, -1:]
-            logits = self.forward(cur_ids, n_loops=n_loops, kv_cache=kv_cache)
+            if step == 0:
+                cur_ids = input_ids
+                start_pos = 0
+            else:
+                cur_ids = input_ids[:, -1:]
+                start_pos = prompt_len + step - 1
+            logits = self.forward(
+                cur_ids, n_loops=n_loops, kv_cache=kv_cache, start_pos=start_pos
+            )
             logits = logits[:, -1, :] / temperature
             if top_k > 0:
                 v, _ = logits.topk(top_k)
